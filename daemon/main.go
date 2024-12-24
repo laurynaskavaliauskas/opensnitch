@@ -67,7 +67,7 @@ var (
 	noLiveReload      = false
 	queueNum          = 0
 	repeatQueueNum    int //will be set later to queueNum + 1
-	workers           = 16
+	workers           = 128
 	debug             = false
 	warning           = false
 	important         = false
@@ -85,7 +85,7 @@ var (
 	rules         = (*rule.Loader)(nil)
 	stats         = (*statistics.Statistics)(nil)
 	queue         = (*netfilter.Queue)(nil)
-	repeatPktChan = (<-chan netfilter.Packet)(nil)
+	repeatPktChan = [](<-chan netfilter.Packet)(nil)
 	pktChan       = (<-chan netfilter.Packet)(nil)
 	wrkChan       = (chan netfilter.Packet)(nil)
 	sigChan       = (chan os.Signal)(nil)
@@ -215,7 +215,8 @@ func worker(id int) {
 				log.Debug("worker channel closed %d", id)
 				goto Exit
 			}
-			onPacket(pkt)
+			log.Debug("worker channel %d picked up packet", id)
+			onPacket(pkt, id)
 		}
 	}
 Exit:
@@ -304,13 +305,16 @@ func initSystemdResolvedMonitor() {
 	}()
 }
 
-func doCleanup(queue, repeatQueue *netfilter.Queue) {
+func doCleanup(queue *netfilter.Queue, repeatQueue []*netfilter.Queue) {
 	log.Info("Cleaning up ...")
 	firewall.Stop()
 	monitor.End()
 	uiClient.Close()
 	queue.Close()
-	repeatQueue.Close()
+	for q := 0; q < workers; q++ {
+		repeatQueue[q].Close()
+	}
+
 	if resolvMonitor != nil {
 		resolvMonitor.Close()
 	}
@@ -333,7 +337,7 @@ func doCleanup(queue, repeatQueue *netfilter.Queue) {
 	}
 }
 
-func onPacket(packet netfilter.Packet) {
+func onPacket(packet netfilter.Packet, id int) {
 	// DNS response, just parse, track and accept.
 	if dns.TrackAnswers(packet.Packet) == true {
 		packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
@@ -354,7 +358,7 @@ func onPacket(packet netfilter.Packet) {
 	}
 
 	// search a match in preloaded rules
-	r := acceptOrDeny(&packet, con)
+	r := acceptOrDeny(&packet, con, id)
 
 	if r != nil && r.Nolog {
 		return
@@ -375,8 +379,9 @@ func applyDefaultAction(packet *netfilter.Packet, con *conman.Connection) {
 	packet.SetVerdict(netfilter.NF_DROP)
 }
 
-func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
+func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection, id int) *rule.Rule {
 	r := rules.FindFirstMatch(con)
+	log.Debug("Processing packet: %+v", packet)
 	if r == nil {
 		// no rule matched
 		// Note that as soon as we set a verdict on a packet, the next packet in the netfilter queue
@@ -384,49 +389,52 @@ func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
 
 		// send a request to the UI client if
 		// 1) connected and running and 2) we are not already asking
-		if uiClient.Connected() == false || uiClient.GetIsAsking() == true {
+		if uiClient.Connected() == false {
 			applyDefaultAction(packet, con)
 			log.Debug("UI is not running or busy, connected: %v, running: %v", uiClient.Connected(), uiClient.GetIsAsking())
 			return nil
 		}
 
-		uiClient.SetIsAsking(true)
-		defer uiClient.SetIsAsking(false)
+		//uiClient.SetIsAsking(true)
+		//defer uiClient.SetIsAsking(false)
+
+		//var o bool
+		//var pkt netfilter.Packet
 
 		// In order not to block packet processing, we send our packet to a different netfilter queue
-		// and then immediately pull it back out of that queue
-		packet.SetRequeueVerdict(uint16(repeatQueueNum))
+		// and then immediately pull it back out of that queu
+		packet.SetRequeueVerdict(uint16(repeatQueueNum + id))
 
 		var o bool
 		var pkt netfilter.Packet
 		// don't wait for the packet longer than 1 sec
 		select {
-		case pkt, o = <-repeatPktChan:
+		case pkt, o = <-repeatPktChan[id]:
 			if !o {
-				log.Debug("error while receiving packet from repeatPktChan")
+				log.Debug("error while receiving packet from repeatPktChan[%d]", id)
 				return nil
 			}
 		case <-time.After(1 * time.Second):
-			log.Debug("timed out while receiving packet from repeatPktChan")
+			log.Debug("timed out while receiving packet from repeatPktChan[%d]", id)
 			return nil
 		}
 
 		//check if the pulled out packet is the same we put in
 		if res := bytes.Compare(packet.Packet.Data(), pkt.Packet.Data()); res != 0 {
-			log.Error("The packet which was requeued has changed abruptly. This should never happen. Please report this incident to the Opensnitch developers. %v %v ", packet, pkt)
+			log.Error("The packet which was requeued has changed abruptly. This should never happen. Please report this incident to the TruePacket developers. %v %v ", packet, pkt)
 			return nil
 		}
 		packet = &pkt
 
 		// Update the hostname again.
-		// This is required due to a race between the ebpf dns hook and the actual first packet beeing sent
+		// This is required due to a race between the ebpf dns hook and the actual first packet being sent
 		if con.DstHost == "" {
 			con.DstHost = dns.HostOr(con.DstIP, con.DstHost)
 		}
-
+		log.Debug("Asking for Rule")
 		r = uiClient.Ask(con)
 		if r == nil {
-			log.Error("Invalid rule received, applying default action")
+			log.Error("Invalid (null) rule received, applying default action")
 			applyDefaultAction(packet, con)
 			return nil
 		}
@@ -551,15 +559,21 @@ func main() {
 	}
 	pktChan = queue.Packets()
 
-	repeatQueueNum = queueNum + 1
-	repeatQueue, rqerr := netfilter.NewQueue(uint16(repeatQueueNum))
-	if rqerr != nil {
-		msg := fmt.Sprintf("Error creating repeat queue #%d: %s", repeatQueueNum, rqerr)
-		uiClient.SendErrorAlert(msg)
-		log.Warning("Is opensnitchd already running?")
-		log.Warning(msg)
+	var repeatQueue []*netfilter.Queue
+	var rQueue *netfilter.Queue
+	var rqerr error
+	repeatQueueNum = 32000 - workers
+	for q := 0; q < workers; q++ {
+		rQueue, rqerr = netfilter.NewQueue(uint16(repeatQueueNum + q))
+		if rqerr != nil {
+			msg := fmt.Sprintf("Error creating repeat queue #%d: %s", repeatQueueNum+q, rqerr)
+			uiClient.SendErrorAlert(msg)
+			log.Warning("Is opensnitchd already running?")
+			log.Warning(msg)
+		}
+		repeatQueue = append(repeatQueue, rQueue)
+		repeatPktChan = append(repeatPktChan, rQueue.Packets())
 	}
-	repeatPktChan = repeatQueue.Packets()
 
 	// queue is ready, run firewall rules and start intercepting connections
 	if err = firewall.Init(uiClient.GetFirewallType(), &queueNum); err != nil {
