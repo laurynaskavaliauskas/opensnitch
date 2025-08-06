@@ -1,5 +1,8 @@
 # Standalone Docker file for builds without requiring any files pulled from lidlabs. It is meant for testing and will not be updated regularly.
-FROM golang:1.20.14-bookworm  as builder
+# Usage:
+# docker build -f ./utils/packaging/Dockerfile -t "opensnitch-build:1.6.9-tp"
+# docker run -it -v ./:/tmp opensnitch-build:1.6.9-tp bash -c "cp /app/daemon/opensnitchd /tmp/opensnitchd-1.6.9-tp"
+FROM golang:1.20.14-bookworm  AS builder
 
 WORKDIR /app
 
@@ -30,6 +33,7 @@ COPY . .
 RUN cd ./proto && make
 RUN cd ./daemon && go mod tidy
 RUN cd ./daemon && make
+
 
 
 
